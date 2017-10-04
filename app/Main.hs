@@ -11,21 +11,18 @@ import           System.Random
 import           Control.Concurrent
 import           Control.Concurrent.MVar
 import           Control.Monad.IO.Class (liftIO)
-import           Control.Monad (forever, forM, forM_, mzero, liftM)
+import           Control.Monad (forever, forM, forM_, liftM)
 import           Control.Monad.Trans.Class (lift)
 import           Control.Monad.Trans.Either
 import           Control.Distributed.Process
 import           Control.Distributed.Process.Closure
 import           Control.Distributed.Process.Node hiding (newLocalNode)
 import           Control.Distributed.Process.Backend.SimpleLocalnet
-import           Control.Distributed.Process.Extras.Time
-import           Control.Distributed.Process.Extras.Timer
-import           Network.Transport.TCP (createTransport, defaultTCPParameters)
 import           Data.Time.Clock
 import           Data.Time.Clock.POSIX
 import           Data.Binary
-import           Data.Maybe (fromJust, fromMaybe)
-import           Data.List (insertBy, sortBy)
+import           Data.Maybe (fromMaybe)
+import           Data.List (sortBy)
 import           Data.Ord (comparing)
 import           System.Exit
 import           System.IO (hPutStrLn, stderr)
@@ -37,7 +34,7 @@ receiveN :: Int -> Process [(ProcessId, Double, Double)]
 receiveN i = receiveN' i []
   where
     receiveN' 0 ms = return ms
-    receiveN' i ms = do
+    receiveN' _ ms = do
       m <- receiveWait
         [ matchAny (\m -> do
                        s <- unwrapMessage m :: Process (Maybe (ProcessId, Double, Double))
@@ -85,6 +82,7 @@ data RandomState =
   | RandomNext Int [(ProcessId, Int)]  -- ^ A state used to reset the process Id list.
   | Generate Int [(ProcessId, Int)] [(ProcessId, Int, RandomMessage)]
     -- ^ The state where the process is generating messages.
+  | TerminateRandom
   deriving (Generic, Show)
 
 instance Binary RandomState
@@ -120,6 +118,7 @@ data ProcessMessage =
     ProvisioningResult ProcessId [ProcessId]
     -- | The peer process receives a sample from the RNG process.
   | Sample (ProcessId, Double, Double)
+  | TerminateProcess
     deriving (Generic, Show)
 
 instance Binary ProcessMessage
@@ -168,23 +167,23 @@ peerProcess (Provisioning rootPid) = do
   case pm of
     ProvisioningResult rngPid pidList -> do
       peerProcess (Sampling rootPid rngPid pidList)
+    TerminateProcess -> do
       return ()
     _ -> do
       -- error: unexpected message for this state.
       return ()
 peerProcess (Sampling rootPid rngPid pids) = do
-  -- Request a random number from the seeded RNG process on this peer.
+  -- Request a random number from the seeded RNG process at pid.
   self <- getSelfPid
   send rngPid (GetRandom self)
   rm <- expect :: Process RandomMessage
   case rm of
     RandomResult r t -> do
-      -- Send random result to all other pids including self.
+      -- Send random result (m) to all other pids including self.
       forM_ (self:pids) $ \pid ->
         send pid (self, r, t)
       -- Switch to receive peer process messages.
       peerProcess (Receiving rootPid (length (self:pids)))
-      return ()
     _ -> do
       -- error: unexpected message for this state.
       return ()
@@ -192,7 +191,7 @@ peerProcess (Receiving rootPid i) = do
   ms <- receiveN i
   forM_ ms $ \m -> do
     send rootPid m
-  return ()
+  peerProcess (Provisioning rootPid)
 
 remotable ['rngProcess, 'peerProcess]
 
@@ -203,39 +202,40 @@ customRemoteTable =
 ------------------------------------------------------------------------------
 -- | Send to each pid a list of the other pids in the network and the pid of
 -- | this nodes rng process.
-provision :: ProcessId -> [ProcessId] -> Process ()
-provision rng pids = provision' pids []
+fanMessages :: ProcessId -> [ProcessId] -> Process ()
+fanMessages rng pids = fanMessages' pids []
   where
-    provision' [] prev =
+    fanMessages' [] prev =
       return ()
-    provision' (pid:pids) prev = do
+    fanMessages' (pid:pids) prev = do
       send pid (ProvisioningResult rng (prev ++ pids))
-      provision' pids (pid:prev)
+      fanMessages' pids (pid:prev)
 
 ------------------------------------------------------------------------------
 -- | Runs the main peer process during the initial period.
-runPeerProcess :: NodeId -> ProcessId -> [NodeId] -> MVar Int -> Int -> Integer -> Process ()
-runPeerProcess this self peers count seed dfps = do
-  let npeers = length peers
+runPeerProcess :: ProcessId -> [ProcessId] -> MVar Int -> Int -> Integer -> Process ()
+runPeerProcess rng pidList count seed dfps = do
+  let npeers = length pidList
 
   i <- liftIO $ takeMVar count
   liftIO $ putMVar count (i + npeers)
 
-  -- Spawn a process on each peer which waits to be provisioned.
-  pidList <- forM peers $ \peer -> do
-    pid <- spawn peer $ $(mkClosure 'peerProcess) (Provisioning self)
-    return pid
-
-  let pidOrdList = zipWith (\pid i -> (pid, i)) pidList [0..npeers]
-
-  rng <- spawn this $ $(mkClosure 'rngProcess) (RandomInit seed pidOrdList)
-
-  -- Provision each process with the list of other pids.
-  provision rng pidList
+  -- Provision each process with the list of other pids and sample a message
+  -- from the rng process provided. Each node is supposed to sample from its
+  -- own RNG and have the processes on the others sample from this RNG as
+  -- well.
+  fanMessages rng pidList
 
   -- Here there is a thread delay according to the data frames per second.
   let delay = round (1000000.0 / fromIntegral dfps)
   liftIO $ threadDelay delay
+
+------------------------------------------------------------------------------
+-- | Stops the peer process after initial period.
+terminatePeerProcess :: ProcessId -> [ProcessId] -> Process ()
+terminatePeerProcess rng pidList = do
+  forM_ pidList $ \pid -> do
+    send pid TerminateProcess
 
 ------------------------------------------------------------------------------
 -- | From an initial node configuration, start a node with deadlines 'k' and
@@ -261,6 +261,17 @@ runNode (NodeConfig host port) k l seed drain dfps = do
     liftIO . putStrLn $ "Found " ++ show (length peers) ++ " peers @ " ++ show self
 
     liftIO . putStrLn $ "Starting communications @ " ++ show self
+
+    -- Start a process on each peer
+    pidList <- forM peers $ \peer -> do
+      pid <- spawn peer $ $(mkClosure 'peerProcess) (Provisioning self)
+      return pid
+
+    -- Order the pids
+    let pidOrdList = zipWith (\pid i -> (pid, i)) pidList [0..length peers]
+
+    -- Spawn an rng process on this peer with provided seed
+    rng <- spawn this $ $(mkClosure 'rngProcess) (RandomInit seed pidOrdList)
 
     --------------------------------------------------------------------------------
     -- Communication Period
@@ -288,12 +299,13 @@ runNode (NodeConfig host port) k l seed drain dfps = do
         if fromIntegral i >= mlim then do
           -- lift $ liftIO $ putStrLn ("dfps * k * len(P) = " ++ show mlim)
           lift $ liftIO $ putMVar count i
+          lift $ terminatePeerProcess rng pidList
           quit ()
           else do
           lift $ liftIO $ putMVar count i
-          lift $ runPeerProcess this self peers count seed dfps
+          lift $ runPeerProcess rng pidList count seed dfps
         else do
-        lift $ runPeerProcess this self peers count seed dfps
+        lift $ runPeerProcess rng pidList count seed dfps
         return ()
 
     --------------------------------------------------------------------------------
@@ -301,7 +313,7 @@ runNode (NodeConfig host port) k l seed drain dfps = do
     --------------------------------------------------------------------------------
 
     -- Now that the communication loop has ended, enter the grace period. (now + l)
-    liftIO $ putStrLn $ "Entering grace period @ " ++ show self
+    -- liftIO $ putStrLn $ "Entering grace period @ " ++ show self
 
     i <- liftIO $ takeMVar count
 
@@ -313,7 +325,7 @@ runNode (NodeConfig host port) k l seed drain dfps = do
       return lst
 
     let acc = sortBy (comparing snd) $ map (\ (_, r, t) -> (1.0 * r, t)) lst
-    let (rs, ts) = unzip acc
+    let (rs, _) = unzip acc
 
     let len = length acc
 
@@ -328,15 +340,16 @@ runNode (NodeConfig host port) k l seed drain dfps = do
 -- | Forks a node to a concurrent process and increments the seed per peer.
 runNodes :: [NodeConfig] -> Integer -> Integer -> Int -> Bool -> Integer -> IO ()
 runNodes [] _ _ _ _ _ = return ()
-runNodes (nodeConfig:nodes) k l seed drain dfps = do
+runNodes (nodeConfig:nodeConfigs) k l seed drain dfps = do
   _ <- forkChild (runNode nodeConfig k l seed drain dfps)
-  runNodes nodes k l (seed + 1) drain dfps
+  runNodes nodeConfigs k l (seed + 1) drain dfps
 
 ------------------------------------------------------------------------------
 -- | Wait for the nodes to converge or exit if deadline has been reached.
 children :: MVar [MVar ()]
 children = unsafePerformIO (newMVar [])
 
+waitUntil :: t -> UTCTime -> IO ()
 waitUntil ut deadline = do
   cs <- tryTakeMVar children
   case cs of
@@ -374,7 +387,7 @@ main :: IO ()
 main = do
   args <- getArgs
 
-  let (actions, nonOptions, errors) = getOpt RequireOrder options args
+  let (actions, _nonOptions, _errors) = getOpt RequireOrder options args
 
   opts <- foldl (>>=) (return defaultOptions) actions
 
@@ -409,6 +422,7 @@ data Options = Options
   , optDFPS :: Integer
   } deriving (Show)
 
+defaultOptions :: Options
 defaultOptions = Options
   { optSendFor = 5
   , optWaitFor = 5
@@ -448,7 +462,7 @@ inputF arg opt =
   return opt { optDFPS = read $ fromMaybe "3" arg }
 
 printHelp :: Options -> IO Options
-printHelp opt = do
+printHelp _ = do
   prg <- getProgName
   hPutStrLn stderr (usageInfo prg options)
   exitWith ExitSuccess
