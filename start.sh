@@ -24,12 +24,13 @@ while [ $# -gt 0 ]; do
     shift
 done
 
-# slaves
 stack exec iohk-exe -- --host=localhost --port=4001 --seed=$seed &
 stack exec iohk-exe -- --host=localhost --port=4002 --seed=$(($seed + 1)) &
 stack exec iohk-exe -- --host=localhost --port=4003 --seed=$(($seed + 2)) &
 stack exec iohk-exe -- --host=localhost --port=4004 --seed=$(($seed + 3)) &
 stack exec iohk-exe -- --host=localhost --port=4005 --seed=$(($seed + 4)) &
 
-# client
+# wait for the nodes to start
+sleep 3
+
 stack exec iohk-exe -- --node-type=master --host=localhost --port=4006 --send-for=$send_for --wait-for=$wait_for
